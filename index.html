@@ -186,6 +186,26 @@
   }
   .meta strong { color: var(--ink-dim); font-weight: 500; }
 
+  /* Crédito de autoría — usa serif itálica como las firmas editoriales */
+  .meta.author { line-height: 1.3; }
+  .meta.author .author-prefix {
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-size: 13px;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--ink-faint);
+  }
+  .meta.author .author-name {
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-weight: 500;
+    font-size: 22px;
+    letter-spacing: -0.01em;
+    color: var(--accent);
+    text-transform: none;
+  }
+
   /* ─── Hero (título + bajada) ──────────────────────────────────── */
   .hero {
     margin-bottom: 56px;
@@ -527,9 +547,9 @@
       <span>XSLT&nbsp;<em>Forge</em></span>
     </div>
     <div class="tagline">JSON <span>·</span> XML <span>·</span> XSLT <span>·</span> XSD &nbsp;Transformer / Validator</div>
-    <div class="meta">
-      <strong>BROWSER-NATIVE</strong><br/>
-      no servers · no uploads
+    <div class="meta author">
+      <span class="author-prefix">hecha por</span><br/>
+      <strong class="author-name">Daniel Musial</strong>
     </div>
   </header>
 
@@ -617,7 +637,7 @@
 
   <footer>
     <span>FORGED IN-BROWSER</span>
-    <span><em>hecha por Daniel Musial</em></span>
+    <span><em>An exercise in markup alchemy</em></span>
     <span>v1.0 · 2026</span>
   </footer>
 
