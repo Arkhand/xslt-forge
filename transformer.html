@@ -1,0 +1,1221 @@
+<!DOCTYPE html>
+<!--
+═══════════════════════════════════════════════════════════════════════════════
+  XSLT FORGE — JSON / XML → XSLT TRANSFORMER
+═══════════════════════════════════════════════════════════════════════════════
+
+  PROPÓSITO
+  ─────────
+  Página single-file (sin build, sin servidor, sin dependencias) que:
+
+    1. Acepta un payload en JSON o XML en el textarea de la izquierda.
+    2. Detecta automáticamente el formato y, si es JSON, lo convierte a XML
+       internamente antes de transformar.
+    3. Acepta una hoja XSLT en el textarea de la derecha.
+    4. Al apretar "Convert", aplica la transformación XSLT usando el
+       XSLTProcessor nativo del navegador y muestra el resultado abajo,
+       haciendo scroll suave hasta él.
+    5. Hace beautify automático al pegar JSON, XML o XSLT.
+    6. Persiste ambos inputs en localStorage (sobrevive al recargar).
+
+  POR QUÉ ESTÁ TODO EN UN SOLO ARCHIVO
+  ─────────────────────────────────────
+  - Cero build step (no hay npm, webpack, etc.).
+  - Se puede subir como `index.html` a GitHub Pages, Netlify Drop, etc.
+  - Se puede abrir directo con doble click — no necesita servidor.
+  - Fácil de versionar, compartir y leer de punta a punta.
+
+  ESTRUCTURA DEL ARCHIVO
+  ──────────────────────
+  1. <head>: meta + fonts (Fraunces + JetBrains Mono) + <style> embebido.
+  2. <body>: header + hero + grid de 2 inputs + botón Convert + output.
+  3. <script>: lógica completa (detección, conversión, beautify, XSLT, storage).
+
+  STACK / TECNOLOGÍAS USADAS
+  ──────────────────────────
+  - HTML/CSS/JS vanilla (zero deps).
+  - DOMParser para validar XML/XSLT.
+  - XSLTProcessor (API nativa del navegador) para la transformación real.
+  - localStorage para persistencia.
+  - Google Fonts para tipografía (única dependencia externa).
+
+  COSAS QUE ES BUENO SABER ANTES DE EDITAR
+  ────────────────────────────────────────
+  - El estilo apunta a un look editorial oscuro (acento dorado #d4a017).
+    Si querés cambiar la paleta, todas las variables están en :root.
+  - La conversión JSON→XML usa estas convenciones:
+      • claves "@xxx"  → atributos del padre
+      • clave  "#text" → nodo de texto del padre
+      • arrays         → repetición del tag (o <item> si es array suelto)
+  - El beautify de XML es manual (no DOMParser → serializeToString)
+    porque queríamos preservar la declaración <?xml ...?> y tener
+    indentado predecible cross-browser.
+
+═══════════════════════════════════════════════════════════════════════════════
+-->
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>XSLT Forge — JSON / XML Transformer</title>
+
+<!-- Tipografías de Google Fonts (única dependencia externa) -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,500;0,9..144,700;1,9..144,500&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  /* ═══════════════════════════════════════════════════════════════════
+     DESIGN TOKENS
+     Toda la paleta y los colores estructurales se controlan desde acá.
+     Si querés rebrandear: tocá estas variables y listo.
+     ═══════════════════════════════════════════════════════════════════ */
+  :root {
+    --bg:          #0e0d0b;   /* fondo principal (casi negro, cálido) */
+    --bg-elev:     #16140f;   /* fondo de paneles (un toque más claro) */
+    --ink:         #f4ead5;   /* texto principal (crema) */
+    --ink-dim:     #b8ad94;   /* texto secundario */
+    --ink-faint:   #6b6453;   /* texto terciario / hints */
+    --accent:      #d4a017;   /* dorado — acción primaria */
+    --accent-soft: #3a2d10;   /* dorado oscuro para selección */
+    --danger:      #e26d5a;   /* rojo cálido para errores */
+    --ok:          #8fb866;   /* verde oliva (no muy usado, reservado) */
+    --rule:        #2a261d;   /* líneas divisorias suaves */
+    --rule-strong: #3a3528;   /* líneas divisorias enfáticas */
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: 'Fraunces', Georgia, serif;
+    /* ss01/ss02 activan stylistic sets de Fraunces (numerales más lindos) */
+    font-feature-settings: "ss01", "ss02";
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Capa de gradientes radiales — da atmósfera al fondo plano. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background-image:
+      radial-gradient(ellipse at 20% 0%,   rgba(212, 160, 23, 0.08), transparent 50%),
+      radial-gradient(ellipse at 80% 100%, rgba(212, 160, 23, 0.05), transparent 50%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* Capa de "grano" SVG inline — textura sutil tipo papel. */
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.04 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    opacity: 0.4;
+    mix-blend-mode: overlay;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  .container {
+    position: relative;
+    z-index: 2;                /* arriba de las capas decorativas */
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 48px 40px 80px;
+  }
+
+  /* ─── Header ──────────────────────────────────────────────────── */
+  header {
+    display: grid;
+    grid-template-columns: auto 1fr auto;   /* logo | tagline | meta */
+    align-items: end;
+    gap: 32px;
+    padding-bottom: 28px;
+    border-bottom: 1px solid var(--rule);
+    margin-bottom: 48px;
+  }
+
+  .logo {
+    font-family: 'Fraunces', serif;
+    font-weight: 700;
+    font-size: 28px;
+    letter-spacing: -0.03em;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .logo-mark {
+    width: 36px; height: 36px;
+    border: 1.5px solid var(--accent);
+    border-radius: 50%;
+    display: grid; place-items: center;
+    color: var(--accent);
+    font-style: italic;
+    font-weight: 500;
+    font-size: 18px;
+  }
+  .logo em { font-style: italic; color: var(--accent); font-weight: 500; }
+
+  .tagline {
+    text-align: center;
+    font-size: 13px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .tagline span { color: var(--accent); }
+
+  .meta {
+    text-align: right;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--ink-faint);
+    letter-spacing: 0.1em;
+    line-height: 1.6;
+  }
+  .meta strong { color: var(--ink-dim); font-weight: 500; }
+
+  /* ─── Hero (título + bajada) ──────────────────────────────────── */
+  .hero {
+    margin-bottom: 56px;
+    max-width: 780px;
+  }
+  .hero h1 {
+    font-size: clamp(42px, 6vw, 72px);   /* fluido entre mobile y desktop */
+    font-weight: 300;
+    line-height: 0.98;
+    letter-spacing: -0.04em;
+    margin-bottom: 20px;
+  }
+  .hero h1 em {
+    font-style: italic;
+    font-weight: 500;
+    color: var(--accent);
+  }
+  .hero p {
+    color: var(--ink-dim);
+    font-size: 17px;
+    line-height: 1.55;
+    max-width: 560px;
+  }
+
+  /* ─── Grid de inputs (2 columnas en desktop) ──────────────────── */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    margin-bottom: 32px;
+  }
+
+  /* En pantallas chicas, una sola columna. */
+  @media (max-width: 900px) {
+    .grid   { grid-template-columns: 1fr; }
+    header  { grid-template-columns: 1fr; text-align: left; }
+    .meta, .tagline { text-align: left; }
+  }
+
+  /* ─── Panel (caja de input) ───────────────────────────────────── */
+  .panel {
+    background: var(--bg-elev);
+    border: 1px solid var(--rule);
+    border-radius: 2px;          /* casi cuadrado, look editorial */
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    transition: border-color 0.3s ease;
+  }
+  .panel:focus-within { border-color: var(--rule-strong); }
+
+  .panel-header {
+    padding: 18px 22px 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .panel-title {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  .panel-num {                            /* "01 ·" en monoespaciada dorada */
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.15em;
+  }
+  .panel-title h2 {
+    font-size: 22px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+  .panel-title h2 em { font-style: italic; color: var(--ink-dim); font-weight: 400; }
+
+  /* ─── Badges de estado (JSON ✓ / XML ✓ / · invalid / empty) ───── */
+  .badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    padding: 4px 10px;
+    border: 1px solid var(--rule-strong);
+    border-radius: 999px;
+    color: var(--ink-faint);
+    transition: all 0.25s ease;
+  }
+  .badge.json   { color: var(--accent); border-color: var(--accent); }
+  .badge.xml    { color: #6fb3d4;       border-color: #4d7e94; }
+  .badge.error  { color: var(--danger); border-color: var(--danger); }
+  .badge.empty  { color: var(--ink-faint); }
+
+  /* Contenedor de la derecha del panel-header (badge + botón clear) */
+  .panel-header-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  /* Botón × para vaciar el textarea (también borra de localStorage) */
+  .btn-clear {
+    background: transparent;
+    border: 1px solid var(--rule-strong);
+    color: var(--ink-faint);
+    width: 24px;
+    height: 24px;
+    line-height: 1;
+    font-size: 16px;
+    border-radius: 50%;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    transition: all 0.2s ease;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .btn-clear:hover {
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+
+  /* ─── Textareas ───────────────────────────────────────────────── */
+  textarea {
+    flex: 1;
+    width: 100%;
+    min-height: 380px;
+    padding: 20px 22px;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--ink);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    line-height: 1.65;
+    resize: vertical;            /* solo se redimensionan en alto */
+    tab-size: 2;
+  }
+  textarea::placeholder {
+    color: var(--ink-faint);
+    font-style: italic;
+    font-family: 'Fraunces', serif;   /* placeholder en serif para que destaque */
+    font-size: 14px;
+  }
+  textarea::selection { background: var(--accent-soft); }
+
+  /* ─── Barra de acciones (con el botón Convert) ────────────────── */
+  .actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    padding: 24px 0;
+    margin-bottom: 24px;
+    border-top: 1px solid var(--rule);
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .hint {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+  }
+  .hint span { color: var(--accent); }
+
+  .btn-convert {
+    position: relative;
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    padding: 18px 56px;
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-weight: 500;
+    font-size: 22px;
+    letter-spacing: -0.01em;
+    cursor: pointer;
+    border-radius: 2px;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    overflow: hidden;
+  }
+  /* Flecha "→" antes del texto que se desplaza al hacer hover. */
+  .btn-convert::before {
+    content: "→";
+    margin-right: 12px;
+    display: inline-block;
+    transition: transform 0.3s ease;
+    font-style: normal;
+  }
+  .btn-convert:hover {
+    background: #e6b020;
+    transform: translateY(-1px);
+    box-shadow: 0 12px 32px rgba(212, 160, 23, 0.3);
+  }
+  .btn-convert:hover::before { transform: translateX(6px); }
+  .btn-convert:active { transform: translateY(0); }
+  .btn-convert:disabled {
+    background: var(--rule-strong);
+    color: var(--ink-faint);
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+  }
+
+  /* ─── Output ──────────────────────────────────────────────────── */
+  #output-section {
+    /* Margen para que el smooth-scroll no quede pegado al borde superior */
+    scroll-margin-top: 24px;
+  }
+
+  .output-panel {
+    background: var(--bg-elev);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    overflow: hidden;
+    min-height: 300px;
+  }
+
+  .output-header {
+    padding: 18px 22px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--rule);
+  }
+  .output-header h2 {
+    font-size: 22px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+  .output-header h2 em { font-style: italic; color: var(--accent); font-weight: 500; }
+
+  .output-actions { display: flex; gap: 10px; }
+
+  /* Botón "fantasma" — usado para Copy y Download */
+  .btn-ghost {
+    background: transparent;
+    border: 1px solid var(--rule-strong);
+    color: var(--ink-dim);
+    padding: 8px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    cursor: pointer;
+    border-radius: 2px;
+    transition: all 0.2s ease;
+  }
+  .btn-ghost:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Body del resultado — el HTML adentro tiene sintaxis resaltada. */
+  pre.output-body {
+    padding: 24px;
+    margin: 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    color: var(--ink);
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-x: auto;
+    min-height: 240px;
+  }
+  pre.output-body.empty {
+    color: var(--ink-faint);
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-size: 15px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+  }
+  pre.output-body.error { color: var(--danger); }
+
+  /* Clases usadas por el syntax highlighter manual del output. */
+  .tag-bracket { color: #7a7160; }
+  .tag-name    { color: #d4a017; }
+  .attr-name   { color: #b58863; }
+  .attr-value  { color: #8fb866; }
+  .text-node   { color: #f4ead5; }
+  .comment     { color: #5a5343; font-style: italic; }
+  .declaration { color: #6fb3d4; }
+
+  /* ─── Footer ──────────────────────────────────────────────────── */
+  footer {
+    margin-top: 80px;
+    padding-top: 28px;
+    border-top: 1px solid var(--rule);
+    display: flex;
+    justify-content: space-between;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.15em;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+  }
+  footer em { color: var(--accent); font-style: italic; text-transform: none; letter-spacing: 0; }
+
+  /* ─── Animaciones ─────────────────────────────────────────────── */
+  /* Aparición escalonada al cargar — header → hero → grid → actions */
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  header   { animation: rise 0.7s ease 0s    both; }
+  .hero    { animation: rise 0.7s ease 0.1s  both; }
+  .grid    { animation: rise 0.7s ease 0.2s  both; }
+  .actions { animation: rise 0.7s ease 0.3s  both; }
+
+  /* Pulso sutil del botón Convert cuando está habilitado. */
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0   rgba(212, 160, 23, 0.4); }
+    50%      { box-shadow: 0 0 0 8px rgba(212, 160, 23, 0); }
+  }
+  .btn-convert.ready { animation: pulse 2s infinite; }
+</style>
+</head>
+
+<body>
+<div class="container">
+
+  <!-- ════════════════════════════════════════════════════════════════
+       HEADER: logo · tagline · meta
+       ════════════════════════════════════════════════════════════════ -->
+  <header>
+    <div class="logo">
+      <span class="logo-mark">f</span>
+      <span>XSLT&nbsp;<em>Forge</em></span>
+    </div>
+    <div class="tagline">JSON <span>·</span> XML <span>·</span> XSLT &nbsp;Transformer</div>
+    <div class="meta">
+      <strong>BROWSER-NATIVE</strong><br/>
+      no servers · no uploads
+    </div>
+  </header>
+
+  <!-- ════════════════════════════════════════════════════════════════
+       HERO: título grande con bajada explicativa
+       ════════════════════════════════════════════════════════════════ -->
+  <section class="hero">
+    <h1>Forge a payload, <em>transform</em> it with elegance.</h1>
+    <p>Paste a JSON or XML payload on the left — we'll detect its type and beautify it automatically. Drop your XSLT stylesheet on the right, then press <em>Convert</em> to see the transformation rendered below.</p>
+  </section>
+
+  <!-- ════════════════════════════════════════════════════════════════
+       GRID DE INPUTS (2 columnas en desktop, 1 en mobile)
+       ════════════════════════════════════════════════════════════════ -->
+  <div class="grid">
+
+    <!-- ── Panel 01: Payload (JSON o XML) ───────────────────────── -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span class="panel-num">01 ·</span>
+          <h2>Payload <em>(JSON or XML)</em></h2>
+        </div>
+        <div class="panel-header-right">
+          <!-- El badge se actualiza dinámicamente: empty / json / xml / error -->
+          <span id="payload-badge" class="badge empty">empty</span>
+          <!-- Botón × para vaciar este input (data-target identifica cuál) -->
+          <button class="btn-clear" data-target="payload" title="Clear">×</button>
+        </div>
+      </div>
+      <textarea
+        id="payload"
+        spellcheck="false"
+        placeholder='Paste your JSON or XML here. We detect the format on paste — JSON gets quietly converted to XML before transformation.'
+      ></textarea>
+    </div>
+
+    <!-- ── Panel 02: Stylesheet (XSLT) ──────────────────────────── -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span class="panel-num">02 ·</span>
+          <h2>Stylesheet <em>(XSLT)</em></h2>
+        </div>
+        <div class="panel-header-right">
+          <span id="xslt-badge" class="badge empty">empty</span>
+          <button class="btn-clear" data-target="xslt" title="Clear">×</button>
+        </div>
+      </div>
+      <textarea
+        id="xslt"
+        spellcheck="false"
+        placeholder='Paste your XSLT here. We&apos;ll auto-format it on paste so you can read it before pressing Convert.'
+      ></textarea>
+    </div>
+
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════
+       ACTIONS BAR: hint · Convert · hint
+       El botón está disabled hasta que ambos inputs sean válidos.
+       ════════════════════════════════════════════════════════════════ -->
+  <div class="actions">
+    <div class="hint">paste either input — <span>auto beautify</span> on detection</div>
+    <button id="convert" class="btn-convert" disabled>Convert</button>
+    <div class="hint">output scrolls into view <span>↓</span></div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════
+       OUTPUT: ahí cae el resultado de la transformación XSLT.
+       El #output-section tiene scroll-margin-top para el smooth-scroll.
+       ════════════════════════════════════════════════════════════════ -->
+  <section id="output-section">
+    <div class="output-panel">
+      <div class="output-header">
+        <h2>03 · <em>Result</em></h2>
+        <div class="output-actions">
+          <button id="copy-btn"     class="btn-ghost" disabled>Copy</button>
+          <button id="download-btn" class="btn-ghost" disabled>Download</button>
+        </div>
+      </div>
+      <pre id="output" class="output-body empty">No transformation yet. Provide both inputs and press Convert.</pre>
+    </div>
+  </section>
+
+  <footer>
+    <span>FORGED IN-BROWSER</span>
+    <span><em>An exercise in markup alchemy</em></span>
+    <span>v1.0 · 2026</span>
+  </footer>
+
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════════════
+   ESTADO GLOBAL DE LA APP
+   ═══════════════════════════════════════════════════════════════════════════
+   Mantenemos un objeto `state` con el estado validado de los inputs.
+   El payload SIEMPRE se guarda como string XML (incluso si vino como JSON),
+   porque es lo que necesitamos para alimentar el XSLTProcessor más adelante.
+*/
+const state = {
+  payloadValid: false,        // ¿el payload parsea OK?
+  xsltValid:    false,        // ¿el XSLT parsea OK?
+  payloadType:  null,         // 'json' | 'xml' | null
+  payloadAsXmlString: null    // representación XML del payload (siempre que sea válido)
+};
+
+// ── Referencias DOM (cacheadas una sola vez al cargar el script) ──
+const $payload      = document.getElementById('payload');
+const $xslt         = document.getElementById('xslt');
+const $payloadBadge = document.getElementById('payload-badge');
+const $xsltBadge    = document.getElementById('xslt-badge');
+const $convert      = document.getElementById('convert');
+const $output       = document.getElementById('output');
+const $copy         = document.getElementById('copy-btn');
+const $download     = document.getElementById('download-btn');
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   DETECCIÓN DE FORMATO
+   ═══════════════════════════════════════════════════════════════════════════
+   Heurística simple basada en el primer caracter no-blanco:
+     - '{' o '[' → JSON
+     - '<'       → XML
+     - resto     → intenta JSON.parse y, si falla, asume XML
+*/
+function detectType(text) {
+  const t = text.trim();
+  if (!t) return null;
+  if (t.startsWith('{') || t.startsWith('[')) return 'json';
+  if (t.startsWith('<'))                       return 'xml';
+  // Fallback: probamos JSON.parse antes de rendirnos
+  try { JSON.parse(t); return 'json'; } catch (_) {}
+  return 'xml';
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   CONVERSIÓN JSON → XML
+   ═══════════════════════════════════════════════════════════════════════════
+   Convenciones que respetamos:
+     - object         → un <key>…</key> por cada propiedad
+     - array          → repetimos el tag del key padre
+                        (si está suelto sin clave, usamos <item>)
+     - primitivo      → nodo de texto
+     - clave "@xxx"   → atributo del padre (en lugar de hijo)
+     - clave "#text"  → contenido textual del padre
+     - root           → si el JSON tiene una sola clave de nivel raíz,
+                        la usamos como root; si no, envolvemos en <root>
+
+   Edge cases que cubrimos:
+     - nombres de tag inválidos (espacios, caracteres raros) → sanitizados
+     - tags que empiezan con número → prefijados con "_"
+     - valores con &, <, > → escapados correctamente
+*/
+
+// Asegura que un nombre de tag sea XML-válido.
+function sanitizeTagName(name) {
+  let n = String(name).replace(/[^a-zA-Z0-9_\-:.]/g, '_');
+  if (!/^[a-zA-Z_]/.test(n)) n = '_' + n;       // no puede empezar con número
+  return n;
+}
+
+// Escapado para texto dentro de elementos.
+function escapeXmlText(s) {
+  return String(s)
+    .replace(/&/g,  '&amp;')
+    .replace(/</g,  '&lt;')
+    .replace(/>/g,  '&gt;');
+}
+
+// Escapado para valores de atributo (incluye comillas dobles).
+function escapeXmlAttr(s) {
+  return escapeXmlText(s).replace(/"/g, '&quot;');
+}
+
+// Función principal recursiva. Devuelve un string XML.
+function jsonToXml(obj, rootName = 'root') {
+
+  // Helper interno: serializa un nodo arbitrario bajo el tag `name`.
+  function build(node, name) {
+    name = sanitizeTagName(name);
+
+    // 1. null/undefined → tag vacío auto-cerrado.
+    if (node === null || node === undefined) return `<${name}/>`;
+
+    const type = typeof node;
+
+    // 2. Primitivos → nodo de texto.
+    if (type === 'string' || type === 'number' || type === 'boolean') {
+      return `<${name}>${escapeXmlText(node)}</${name}>`;
+    }
+
+    // 3. Array → wrap bajo el name padre con <item> repetidos.
+    //    Caso de uso típico: { tags: ["a","b"] } → <tags><item>a</item><item>b</item></tags>
+    if (Array.isArray(node)) {
+      const inner = node.map(v => build(v, 'item')).join('');
+      return `<${name}>${inner}</${name}>`;
+    }
+
+    // 4. Objeto → procesamos atributos, texto y children por separado.
+    const attrs    = [];
+    const children = [];
+    let textContent = null;
+
+    for (const [k, v] of Object.entries(node)) {
+
+      // 4a. Claves "@xxx" → atributos del nodo actual.
+      if (k.startsWith('@') && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')) {
+        attrs.push(`${sanitizeTagName(k.slice(1))}="${escapeXmlAttr(v)}"`);
+
+      // 4b. Clave especial "#text" → contenido textual.
+      } else if (k === '#text') {
+        textContent = escapeXmlText(v);
+
+      // 4c. Arrays bajo una clave → repetimos el tag con esa clave.
+      //     { items: [{a:1},{a:2}] } → <items>...</items><items>...</items>
+      } else if (Array.isArray(v)) {
+        for (const item of v) children.push(build(item, k));
+
+      // 4d. Resto → child normal.
+      } else {
+        children.push(build(v, k));
+      }
+    }
+
+    const attrStr = attrs.length ? ' ' + attrs.join(' ') : '';
+
+    // Tag completamente vacío → self-closing
+    if (children.length === 0 && textContent === null && attrs.length === 0) {
+      return `<${name}/>`;
+    }
+    // Solo texto, sin children
+    if (children.length === 0 && textContent !== null) {
+      return `<${name}${attrStr}>${textContent}</${name}>`;
+    }
+    // Caso general: atributos + texto + children
+    return `<${name}${attrStr}>${textContent ?? ''}${children.join('')}</${name}>`;
+  }
+
+  // ── Lógica del root ──
+  // Tratamos de inferir un root "natural" del JSON cuando es posible.
+  let xmlBody;
+
+  if (Array.isArray(obj)) {
+    // Array suelto en la raíz → <root><item>...</item>...</root>
+    xmlBody = `<${rootName}>${obj.map(v => build(v, 'item')).join('')}</${rootName}>`;
+
+  } else if (obj !== null && typeof obj === 'object') {
+    // Si el objeto tiene exactamente una clave útil, la usamos como root.
+    // Esto evita el envoltorio doble: { person: {...} } → <person>...</person>
+    // en lugar de <root><person>...</person></root>.
+    const keys = Object.keys(obj).filter(k => !k.startsWith('@') && k !== '#text');
+    if (keys.length === 1 && !Array.isArray(obj[keys[0]])) {
+      xmlBody = build(obj[keys[0]], keys[0]);
+    } else {
+      xmlBody = build(obj, rootName);
+    }
+  } else {
+    // Primitivo en la raíz (raro pero válido)
+    xmlBody = build(obj, rootName);
+  }
+
+  return `<?xml version="1.0" encoding="UTF-8"?>\n${xmlBody}`;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   BEAUTIFY (auto-formato al pegar)
+   ═══════════════════════════════════════════════════════════════════════════
+*/
+
+// JSON: trivial, JSON.parse + JSON.stringify con indentación 2.
+// Devuelve null si no parsea (así el caller decide qué hacer).
+function beautifyJson(text) {
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2);
+  } catch (_) {
+    return null;
+  }
+}
+
+// XML: pretty-print manual.
+// ¿Por qué manual y no DOMParser → XMLSerializer? Porque:
+//   1. XMLSerializer no indenta (todo queda en una línea).
+//   2. Algunas librerías nativas se comen la declaración <?xml ... ?>.
+//   3. Queríamos consistencia cross-browser.
+function beautifyXml(text) {
+  try {
+    // Validamos primero — si no es XML válido, devolvemos null.
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(text, 'application/xml');
+    const errNode = doc.querySelector('parsererror');
+    if (errNode) return null;
+
+    let xml = text.trim();
+
+    // Extraemos la declaración XML (<?xml ...?>) si existe, para preservarla.
+    let declaration = '';
+    const declMatch = xml.match(/^<\?xml[^?]*\?>\s*/);
+    if (declMatch) {
+      declaration = declMatch[0].trim();
+      xml = xml.slice(declMatch[0].length);
+    }
+
+    // Limpiamos espacios entre tags y luego insertamos saltos de línea
+    // entre cada apertura/cierre.
+    xml = xml.replace(/>\s+</g, '><').trim();
+    xml = xml.replace(/(>)(<)(\/*)/g, '$1\n$2$3');
+
+    // Recorremos línea por línea y mantenemos un nivel de indent.
+    const lines  = xml.split('\n');
+    const PAD    = '  ';
+    const out    = [];
+    let   indent = 0;
+
+    for (let line of lines) {
+      line = line.trim();
+      if (!line) continue;
+
+      // Clasificamos cada línea para decidir cuánto indentar.
+      const isClosing      = /^<\/[^>]+>/.test(line);
+      const isSelfClosing  = /^<[^!?][^>]*\/>$/.test(line);
+      const isDeclaration  = /^<\?[^>]+\?>/.test(line);
+      const isComment      = /^<!--[\s\S]*-->$/.test(line);
+      const isOpening      = /^<[^!?\/][^>]*[^\/]>$/.test(line) && !isSelfClosing;
+      // Caso especial: <a>texto</a> en una sola línea → no requiere indent extra
+      const hasInlineClose = /^<([^\s\/>]+)[^>]*>[^<]*<\/\1>$/.test(line);
+
+      if (isClosing) indent = Math.max(0, indent - 1);
+      out.push(PAD.repeat(indent) + line);
+      if (isOpening && !hasInlineClose && !isSelfClosing && !isDeclaration && !isComment) {
+        indent++;
+      }
+    }
+
+    const body = out.join('\n');
+    return declaration ? `${declaration}\n${body}` : body;
+  } catch (_) {
+    return null;
+  }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SYNTAX HIGHLIGHTING (para el output)
+   ═══════════════════════════════════════════════════════════════════════════
+   No usamos ninguna lib de highlighting para mantener el archivo solo.
+   El approach es regex-based:
+     1. Escapamos HTML primero (& < >) para evitar XSS.
+     2. Aplicamos regexes incrementalmente para envolver las partes relevantes
+        en <span class="..."> con las clases que ya están definidas en el CSS.
+   Es "buena onda", no perfecto — para casos exóticos (CDATA muy raro,
+   namespaces complejos) puede fallar, pero alcanza para 99% de XSLT outputs.
+*/
+function highlightXml(xml) {
+  const escaped = xml
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  return escaped
+    // Declaración / processing instructions: <?xml ... ?>
+    .replace(/(&lt;\?[\s\S]*?\?&gt;)/g, '<span class="declaration">$1</span>')
+    // Comentarios: <!-- ... -->
+    .replace(/(&lt;!--[\s\S]*?--&gt;)/g, '<span class="comment">$1</span>')
+    // Tags con sus atributos
+    .replace(/(&lt;\/?)([a-zA-Z_][\w:-]*)([^&]*?)(\/?&gt;)/g,
+      (m, open, name, attrs, close) => {
+        // Dentro del bloque de atributos, resaltamos pares name="value".
+        const styledAttrs = attrs.replace(
+          /([a-zA-Z_][\w:-]*)(=)(&quot;[^&]*?&quot;|&#39;[^&]*?&#39;)/g,
+          '<span class="attr-name">$1</span>$2<span class="attr-value">$3</span>'
+        );
+        return `<span class="tag-bracket">${open}</span><span class="tag-name">${name}</span>${styledAttrs}<span class="tag-bracket">${close}</span>`;
+      });
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   VALIDACIÓN EN VIVO + ACTUALIZACIÓN DE BADGES
+   ═══════════════════════════════════════════════════════════════════════════
+   Cada vez que el usuario tipea o pega, corremos validatePayload() o
+   validateXslt(). Esto:
+     - Actualiza el badge de estado.
+     - Mantiene state.payloadValid / state.xsltValid sincronizados.
+     - Llama a refreshConvertState() para habilitar/deshabilitar el botón.
+*/
+
+function setBadge(el, kind, label) {
+  el.className   = 'badge ' + kind;
+  el.textContent = label;
+}
+
+function validatePayload() {
+  const text = $payload.value.trim();
+
+  // Caso vacío
+  if (!text) {
+    state.payloadValid = false;
+    state.payloadType = null;
+    state.payloadAsXmlString = null;
+    setBadge($payloadBadge, 'empty', 'empty');
+    refreshConvertState();
+    return;
+  }
+
+  const type = detectType(text);
+
+  if (type === 'json') {
+    try {
+      const obj = JSON.parse(text);
+      // Convertimos a XML AHORA y guardamos el resultado en el state,
+      // así no tenemos que reconvertir cuando el usuario aprieta Convert.
+      state.payloadAsXmlString = jsonToXml(obj);
+      state.payloadValid = true;
+      state.payloadType = 'json';
+      setBadge($payloadBadge, 'json', 'JSON ✓ → xml');
+    } catch (e) {
+      state.payloadValid = false;
+      setBadge($payloadBadge, 'error', 'JSON · invalid');
+    }
+
+  } else {
+    // Es XML: validamos con DOMParser.
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(text, 'application/xml');
+    if (doc.querySelector('parsererror')) {
+      state.payloadValid = false;
+      setBadge($payloadBadge, 'error', 'XML · invalid');
+    } else {
+      state.payloadAsXmlString = text;
+      state.payloadValid = true;
+      state.payloadType = 'xml';
+      setBadge($payloadBadge, 'xml', 'XML ✓');
+    }
+  }
+
+  refreshConvertState();
+}
+
+function validateXslt() {
+  const text = $xslt.value.trim();
+
+  if (!text) {
+    state.xsltValid = false;
+    setBadge($xsltBadge, 'empty', 'empty');
+    refreshConvertState();
+    return;
+  }
+
+  // XSLT también es XML, así que lo validamos igual.
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(text, 'application/xml');
+  if (doc.querySelector('parsererror')) {
+    state.xsltValid = false;
+    setBadge($xsltBadge, 'error', 'XSLT · invalid');
+  } else {
+    state.xsltValid = true;
+    setBadge($xsltBadge, 'xml', 'XSLT ✓');
+  }
+
+  refreshConvertState();
+}
+
+// Habilita el botón Convert solo cuando ambos inputs son válidos.
+// La clase .ready dispara la animación de pulso del CSS.
+function refreshConvertState() {
+  const ready = state.payloadValid && state.xsltValid;
+  $convert.disabled = !ready;
+  $convert.classList.toggle('ready', ready);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PASTE → AUTO BEAUTIFY
+   ═══════════════════════════════════════════════════════════════════════════
+   Usamos setTimeout(...,0) para que el evento 'paste' termine y el contenido
+   ya esté en el textarea cuando intentamos beautifear. Si lo hiciéramos
+   sincrónicamente, $payload.value todavía sería el valor anterior.
+*/
+$payload.addEventListener('paste', () => {
+  setTimeout(() => {
+    const text = $payload.value;
+    const type = detectType(text);
+    if (type === 'json') {
+      const pretty = beautifyJson(text);
+      if (pretty !== null) $payload.value = pretty;
+    } else if (type === 'xml') {
+      const pretty = beautifyXml(text);
+      if (pretty !== null) $payload.value = pretty;
+    }
+    validatePayload();
+  }, 0);
+});
+
+$xslt.addEventListener('paste', () => {
+  setTimeout(() => {
+    const pretty = beautifyXml($xslt.value);
+    if (pretty !== null) $xslt.value = pretty;
+    validateXslt();
+  }, 0);
+});
+
+// Cualquier otro cambio (escribir, borrar) también valida en vivo.
+$payload.addEventListener('input', validatePayload);
+$xslt.addEventListener('input',    validateXslt);
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PERSISTENCIA EN LOCALSTORAGE
+   ═══════════════════════════════════════════════════════════════════════════
+   Guardamos lo que el usuario escribe para que sobreviva al recargar.
+   Con debounce de 250ms para no martillar el storage en cada tecla.
+   Todo va envuelto en try/catch porque modo incógnito o sitios con storage
+   bloqueado tiran excepción al escribir.
+*/
+const STORAGE_KEYS = {
+  payload: 'xsltforge.payload',
+  xslt:    'xsltforge.xslt'
+};
+
+function saveSoon(key, value) {
+  clearTimeout(saveSoon._t[key]);
+  saveSoon._t[key] = setTimeout(() => {
+    try { localStorage.setItem(key, value); } catch (_) {}
+  }, 250);
+}
+saveSoon._t = {};   // mapa de timers por clave (para el debounce)
+
+$payload.addEventListener('input', () => saveSoon(STORAGE_KEYS.payload, $payload.value));
+$xslt.addEventListener('input',    () => saveSoon(STORAGE_KEYS.xslt,    $xslt.value));
+
+// Restauramos al cargar (IIFE para mantener limpio el scope).
+(function restore() {
+  try {
+    const p = localStorage.getItem(STORAGE_KEYS.payload);
+    const x = localStorage.getItem(STORAGE_KEYS.xslt);
+    if (p) { $payload.value = p; validatePayload(); }
+    if (x) { $xslt.value    = x; validateXslt();    }
+  } catch (_) {}
+})();
+
+// Botones × de cada panel: vacían el textarea y borran del storage.
+document.querySelectorAll('.btn-clear').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const target = btn.dataset.target;
+    if (target === 'payload') {
+      $payload.value = '';
+      try { localStorage.removeItem(STORAGE_KEYS.payload); } catch (_) {}
+      validatePayload();
+      $payload.focus();
+    } else if (target === 'xslt') {
+      $xslt.value = '';
+      try { localStorage.removeItem(STORAGE_KEYS.xslt); } catch (_) {}
+      validateXslt();
+      $xslt.focus();
+    }
+  });
+});
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   RENDERIZADO DEL OUTPUT
+   ═══════════════════════════════════════════════════════════════════════════
+   Helper que centraliza cómo escribimos el resultado:
+     - error=true  → muestra texto plano en rojo, deshabilita Copy/Download.
+     - error=false → aplica syntax highlighting y guarda el raw en
+                     $copy.dataset.raw para que Copy/Download lo usen.
+*/
+function showOutput(text, { error = false } = {}) {
+  $output.classList.remove('empty');
+  $output.classList.toggle('error', error);
+
+  if (error) {
+    $output.textContent = text;          // sin HTML para evitar XSS
+  } else {
+    $output.innerHTML = highlightXml(text);
+  }
+
+  $copy.disabled     = error;
+  $download.disabled = error;
+  $copy.dataset.raw  = error ? '' : text;   // guardamos el texto plano para Copy/Download
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   CORE: TRANSFORMACIÓN XSLT
+   ═══════════════════════════════════════════════════════════════════════════
+   Acá es donde pasa la magia. Usamos las APIs nativas del navegador:
+     - DOMParser     → para parsear payload y XSLT a documentos XML.
+     - XSLTProcessor → motor de transformación XSLT 1.0 incorporado.
+
+   Hacemos un fallback a transformToFragment porque algunas hojas XSLT
+   producen HTML (output method="html") en lugar de XML, y eso transformToDocument
+   maneja distinto que en una hoja "method=xml".
+*/
+$convert.addEventListener('click', () => {
+  if (!state.payloadValid || !state.xsltValid) return;
+
+  try {
+    const parser = new DOMParser();
+
+    // 1. Parsear el payload (que ya está en formato XML, sea porque vino
+    //    así o porque lo convertimos desde JSON en validatePayload).
+    const xmlDoc = parser.parseFromString(state.payloadAsXmlString, 'application/xml');
+    if (xmlDoc.querySelector('parsererror')) {
+      showOutput('Payload could not be parsed as XML after conversion.', { error: true });
+      return;
+    }
+
+    // 2. Parsear el XSLT.
+    const xsltDoc = parser.parseFromString($xslt.value, 'application/xml');
+    if (xsltDoc.querySelector('parsererror')) {
+      showOutput('XSLT stylesheet is not valid XML.', { error: true });
+      return;
+    }
+
+    // 3. Aplicar la transformación.
+    const proc = new XSLTProcessor();
+    proc.importStylesheet(xsltDoc);
+
+    let serialized;
+
+    // Camino feliz: la hoja produce XML.
+    const resultDoc = proc.transformToDocument(xmlDoc);
+    if (resultDoc) {
+      serialized = new XMLSerializer().serializeToString(resultDoc);
+    } else {
+      // Fallback para hojas que producen HTML (no devuelven Document).
+      const fragment = proc.transformToFragment(xmlDoc, document);
+      const div = document.createElement('div');
+      div.appendChild(fragment);
+      serialized = div.innerHTML;
+    }
+
+    // 4. Beautify del resultado (si parsea como XML).
+    const prettified = beautifyXml(serialized) || serialized;
+    showOutput(prettified);
+
+    // 5. Smooth-scroll hasta el output (esto era requerimiento explícito).
+    document.getElementById('output-section').scrollIntoView({
+      behavior: 'smooth',
+      block: 'start'
+    });
+
+  } catch (err) {
+    showOutput('Transformation failed: ' + (err.message || err), { error: true });
+  }
+});
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   COPY / DOWNLOAD del resultado
+   ═══════════════════════════════════════════════════════════════════════════
+   Copy usa la Clipboard API moderna (requiere HTTPS o localhost).
+   Download crea un Blob y un anchor <a download> efímero.
+*/
+$copy.addEventListener('click', async () => {
+  const raw = $copy.dataset.raw;
+  if (!raw) return;
+  try {
+    await navigator.clipboard.writeText(raw);
+    const old = $copy.textContent;
+    $copy.textContent = 'Copied ✓';
+    setTimeout(() => $copy.textContent = old, 1400);
+  } catch (_) {
+    // Si falla (probable: HTTP en lugar de HTTPS), fallamos silenciosamente.
+  }
+});
+
+$download.addEventListener('click', () => {
+  const raw = $copy.dataset.raw;
+  if (!raw) return;
+  const blob = new Blob([raw], { type: 'application/xml' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'result.xml';
+  a.click();
+  URL.revokeObjectURL(a.href);   // liberamos memoria
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   FIN DEL SCRIPT
+   ═══════════════════════════════════════════════════════════════════════════
+   Ideas para extender (próximos pasos potenciales):
+     - Drag & drop de archivos sobre los textareas.
+     - Ejemplos pre-cargados (botones "Load sample").
+     - Toggle entre vista renderizada y vista raw del output HTML.
+     - Soporte para XSLT 2.0/3.0 vía Saxon-JS (rompe el "zero deps", ojo).
+     - Línea de números en los textareas (probablemente con CodeMirror).
+     - Modo claro / toggle de tema.
+*/
+</script>
+</body>
+</html>
