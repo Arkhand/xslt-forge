@@ -37,7 +37,9 @@
   ──────────────────────────
   - HTML/CSS/JS vanilla.
   - DOMParser para validar XML/XSLT/XSD.
-  - XSLTProcessor (API nativa del navegador) para la transformación XSLT.
+  - XSLTProcessor (API nativa del navegador) para la transformación XSLT 1.0.
+  - Saxon-JS 3 HE (vendor/saxonjs3/SaxonJS3.js, lazy-load) para XSLT 2.0/3.0.
+    Compila la hoja en runtime con el XX compiler embebido en el bundle.
   - xmllint-wasm (libxml2 a WASM, lazy-load desde jsdelivr) para XSD.
   - localStorage para persistencia.
   - Google Fonts para tipografía.
@@ -634,7 +636,8 @@ const state = {
   xsltValid:    false,        // ¿el contenido del panel derecho es un XSLT o XSD válido?
   payloadType:  null,         // 'json' | 'xml' | null
   payloadAsXmlString: null,   // representación XML del payload (siempre que sea válido)
-  stylesheetMode: null        // 'xslt' | 'xsd' | null — define qué hace el botón
+  stylesheetMode: null,       // 'xslt' | 'xsd' | null — define qué hace el botón
+  xsltVersion:  null          // '1.0' | '2.0' | '3.0' | null — define qué motor usar
 };
 
 // ── Referencias DOM (cacheadas una sola vez al cargar el script) ──
@@ -1010,15 +1013,22 @@ function validateStylesheet() {
   if (mode === 'xslt') {
     state.xsltValid = true;
     state.stylesheetMode = 'xslt';
-    setBadge($xsltBadge, 'xml', 'XSLT ✓');
+    // version puede ser "1.0", "2.0", "3.0" — default 1.0 si no la declara.
+    state.xsltVersion = doc.documentElement.getAttribute('version') || '1.0';
+    setBadge($xsltBadge, 'xml', `XSLT ${state.xsltVersion} ✓`);
+    // Si es 2.0/3.0, preload del engine en background (el archivo pesa, mejor
+    // empezar a bajarlo ya y no esperar al click). Errores se ignoran acá.
+    if (state.xsltVersion !== '1.0') loadSaxon().catch(() => {});
   } else if (mode === 'xsd') {
     state.xsltValid = true;
     state.stylesheetMode = 'xsd';
+    state.xsltVersion = null;
     setBadge($xsltBadge, 'xsd', 'XSD ✓');
   } else {
     // XML válido pero ni XSLT ni XSD — no sabemos qué hacer con él.
     state.xsltValid = false;
     state.stylesheetMode = null;
+    state.xsltVersion = null;
     setBadge($xsltBadge, 'error', 'not XSLT/XSD');
   }
 
@@ -1164,57 +1174,221 @@ function showOutput(text, { error = false, info = false, success = false, fileNa
 /* ═══════════════════════════════════════════════════════════════════════════
    CORE: TRANSFORMACIÓN XSLT
    ═══════════════════════════════════════════════════════════════════════════
-   Usamos APIs nativas del navegador:
-     - DOMParser     → para parsear payload y XSLT a documentos XML.
-     - XSLTProcessor → motor de transformación XSLT 1.0 incorporado.
+   Tenemos DOS motores y elegimos según la version declarada en la hoja:
 
-   Hacemos un fallback a transformToFragment porque algunas hojas XSLT
-   producen HTML (output method="html") en lugar de XML, y eso transformToDocument
-   maneja distinto que en una hoja "method=xml".
+     • XSLT 1.0  → XSLTProcessor nativo del navegador. Rápido, cero descarga.
+     • XSLT 2.0  → Saxon-JS 3 HE (vendor/saxonjs3/SaxonJS3.js, full edition con
+       y 3.0      el XX compiler embebido). ~2.4 MB lazy-load la primera vez.
+
+   Saxon-JS expone un global `SaxonJS` cuando se carga como classic script.
+
+   El público API SaxonJS.transform({stylesheetText: ...}) acepta SÓLO un SEF
+   pre-compilado en JSON. Para arrancar de XSLT crudo en browser, replicamos
+   la lógica que usa el CLI xslt3-he:
+
+     1) tomar el XX compiler embebido: SaxonJS.internals.getPlatform().resource('compiler')
+     2) addParentPointers() — arma los punteros parent de la SEF (los recorridos
+        del runtime los necesitan; vienen sin ellos para ahorrar memoria).
+     3) internalTransform(compiler, xslDoc, …) con destination='application' e
+        initialMode='compile-complete' → DocumentFragment con la SEF en XML.
+     4) sefToJSON(fragment.firstChild, false) → la SEF en forma de objeto JS.
+     5) addParentPointers() de nuevo sobre la SEF resultante.
+     6) internalTransform(sef, xmlDoc, {destination:'serialized'}) → string final.
 */
-function runXsltTransform() {
+
+// Path al bundle. Carga lazy con un <script> tag — el archivo expone window.SaxonJS.
+const SAXON_URL = 'vendor/saxonjs3/SaxonJS3.js';
+let saxonPromise = null;
+
+function loadSaxon() {
+  if (window.SaxonJS) return Promise.resolve(window.SaxonJS);
+  if (!saxonPromise) {
+    saxonPromise = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = SAXON_URL;
+      s.onload  = () => resolve(window.SaxonJS);
+      s.onerror = () => {
+        saxonPromise = null;     // permitir retry
+        reject(new Error('Failed to load Saxon-JS bundle (' + SAXON_URL + ').'));
+      };
+      document.head.appendChild(s);
+    });
+  }
+  return saxonPromise;
+}
+
+// La SEF viene como árbol C[] sin .parentNode. El runtime lo usa para
+// navegar hacia arriba, así que lo armamos manualmente. Mismo helper
+// usa el CLI xslt3-he antes de invocar internalTransform.
+function addSaxonParentPointers(node) {
+  if (node && node.C) {
+    node.C.forEach(child => {
+      child.parentNode = node;
+      addSaxonParentPointers(child);
+    });
+  }
+}
+
+// XSLT 1.0 — XSLTProcessor nativo. Camino histórico, sigue funcionando igual.
+// Fallback a transformToFragment para hojas que producen HTML (output method="html").
+function runXsltTransformNative() {
   try {
     const parser = new DOMParser();
 
-    // 1. Parsear el payload (que ya está en formato XML, sea porque vino
-    //    así o porque lo convertimos desde JSON en validatePayload).
     const xmlDoc = parser.parseFromString(state.payloadAsXmlString, 'application/xml');
     if (xmlDoc.querySelector('parsererror')) {
       showOutput('Payload could not be parsed as XML after conversion.', { error: true });
       return;
     }
 
-    // 2. Parsear el XSLT.
     const xsltDoc = parser.parseFromString($xslt.value, 'application/xml');
     if (xsltDoc.querySelector('parsererror')) {
       showOutput('XSLT stylesheet is not valid XML.', { error: true });
       return;
     }
 
-    // 3. Aplicar la transformación.
     const proc = new XSLTProcessor();
     proc.importStylesheet(xsltDoc);
 
     let serialized;
-
-    // Camino feliz: la hoja produce XML.
     const resultDoc = proc.transformToDocument(xmlDoc);
     if (resultDoc) {
       serialized = new XMLSerializer().serializeToString(resultDoc);
     } else {
-      // Fallback para hojas que producen HTML (no devuelven Document).
       const fragment = proc.transformToFragment(xmlDoc, document);
+      if (!fragment) {
+        // Si el browser devolvió null acá, casi seguro la hoja no es 1.0.
+        // Damos un mensaje más útil que el "appendChild ... not of type Node".
+        showOutput(
+          'XSLT 1.0 engine returned no result. If your stylesheet uses XSLT 2.0/3.0 ' +
+          'features (format-dateTime, current-dateTime, xsl:function, etc.), set ' +
+          'version="2.0" or "3.0" on <xsl:stylesheet> so XSLT Forge picks the Saxon-JS engine.',
+          { error: true }
+        );
+        return;
+      }
       const div = document.createElement('div');
       div.appendChild(fragment);
       serialized = div.innerHTML;
     }
 
-    // 4. Beautify del resultado (si parsea como XML).
     const prettified = beautifyXml(serialized) || serialized;
     showOutput(prettified, { fileName: 'result.xml' });
 
   } catch (err) {
     showOutput('Transformation failed: ' + (err.message || err), { error: true });
+  }
+}
+
+// XSLT 2.0 / 3.0 — Saxon-JS 3 HE. Dos pasos: compilar a SEF, luego ejecutar.
+async function runXsltTransformSaxon() {
+  showOutput('Loading XSLT 2/3 engine (Saxon-JS 3, ~2.4MB first time)…', { info: true });
+
+  let SaxonJS;
+  try {
+    SaxonJS = await loadSaxon();
+  } catch (err) {
+    showOutput('Could not load Saxon-JS: ' + (err.message || err), { error: true });
+    return;
+  }
+
+  // Validamos que tengamos la API interna que necesitamos (puede romperse en
+  // versiones futuras de SaxonJS — fallar acá es mejor que fallar críptico).
+  if (!SaxonJS.internals || !SaxonJS.internals.getPlatform || !SaxonJS.internals.internalTransform
+      || !SaxonJS.internals.checkOptions || !SaxonJS.internals.XPath
+      || !SaxonJS.internals.XPath.sefToJSON || !SaxonJS.XdmMap || !SaxonJS.XS) {
+    showOutput(
+      'Saxon-JS loaded but the internal compile API is not exposed in this build. ' +
+      'XSLT 2.0/3.0 compilation requires SaxonJS-HE (the bundled vendor copy).',
+      { error: true }
+    );
+    return;
+  }
+
+  // Parseamos los inputs como XML docs y les ponemos el _saxonBaseUri que el
+  // compilador requiere (por el parámetro $stylesheet-base-uri).
+  const parser = new DOMParser();
+  const xslDoc = parser.parseFromString($xslt.value, 'application/xml');
+  if (xslDoc.querySelector('parsererror')) {
+    showOutput('XSLT stylesheet is not valid XML.', { error: true });
+    return;
+  }
+  const xmlDoc = parser.parseFromString(state.payloadAsXmlString, 'application/xml');
+  if (xmlDoc.querySelector('parsererror')) {
+    showOutput('Payload could not be parsed as XML after conversion.', { error: true });
+    return;
+  }
+  xslDoc._saxonBaseUri = xslDoc._saxonDocUri = 'memory:stylesheet.xsl';
+  xmlDoc._saxonBaseUri = xmlDoc._saxonDocUri = 'memory:payload.xml';
+
+  showOutput('Compiling stylesheet with Saxon XX compiler…', { info: true });
+
+  let sef;
+  try {
+    const compiler = SaxonJS.internals.getPlatform().resource('compiler');
+    addSaxonParentPointers(compiler);
+
+    const stylesheetParams = new SaxonJS.XdmMap();
+    stylesheetParams.inSituPut(
+      SaxonJS.XS.QName.fromParts('', '', 'staticParameters'),
+      [new SaxonJS.XdmMap()]
+    );
+
+    const compileOpts = SaxonJS.internals.checkOptions({
+      stylesheetInternal: compiler,
+      destination:        'application',
+      initialMode:        'compile-complete',
+      templateParams:     { 'Q{}options': { noXPath: false } },
+      stylesheetParams:   stylesheetParams,
+      async:              true
+    }, true);
+
+    SaxonJS.internals.internalTransform(compiler, xslDoc, compileOpts);
+    const compileResult = await compileOpts.resultPromise;
+
+    // El resultado viene como DocumentFragment con un <package> SEF en XML.
+    // Convertimos a la forma de objeto JS que entiende el runtime.
+    const fragment = compileResult.principalResult;
+    const pkgNode  = fragment && fragment.firstChild;
+    if (!pkgNode) throw new Error('Compiler returned no package element');
+    sef = SaxonJS.internals.XPath.sefToJSON(pkgNode, false);
+    addSaxonParentPointers(sef);
+  } catch (err) {
+    const code = err && err.code ? `[${err.code}] ` : '';
+    showOutput('XSLT compilation failed: ' + code + (err.message || err), { error: true });
+    return;
+  }
+
+  showOutput('Transforming…', { info: true });
+
+  try {
+    const runOpts = SaxonJS.internals.checkOptions({
+      stylesheetInternal: sef,
+      destination:        'serialized',
+      async:              true
+    }, true);
+
+    SaxonJS.internals.internalTransform(sef, xmlDoc, runOpts);
+    const r = await runOpts.resultPromise;
+
+    const out = (r && r.principalResult) || '';
+    if (!out) {
+      showOutput('Saxon-JS returned an empty result.', { error: true });
+      return;
+    }
+    const prettified = beautifyXml(out) || out;
+    showOutput(prettified, { fileName: 'result.xml' });
+  } catch (err) {
+    const code = err && err.code ? `[${err.code}] ` : '';
+    showOutput('Saxon-JS transform failed: ' + code + (err.message || err), { error: true });
+  }
+}
+
+async function runXsltTransform() {
+  if (state.xsltVersion === '1.0') {
+    runXsltTransformNative();
+  } else {
+    await runXsltTransformSaxon();
   }
 }
 
@@ -1295,7 +1469,7 @@ $convert.addEventListener('click', async () => {
   if (state.stylesheetMode === 'xsd') {
     await runXsdValidation();
   } else {
-    runXsltTransform();
+    await runXsltTransform();
   }
 
   // Smooth-scroll hasta el output (requerimiento original).
@@ -1345,7 +1519,6 @@ $download.addEventListener('click', () => {
      - Drag & drop de archivos sobre los textareas.
      - Ejemplos pre-cargados (botones "Load sample").
      - Toggle entre vista renderizada y vista raw del output HTML.
-     - Soporte para XSLT 2.0/3.0 vía Saxon-JS (rompe el "zero deps", ojo).
      - Línea de números en los textareas (probablemente con CodeMirror).
      - Modo claro / toggle de tema.
 */
