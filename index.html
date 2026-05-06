@@ -6,16 +6,18 @@
 
   PROPÓSITO
   ─────────
-  Página single-file (sin build, sin servidor, sin dependencias) que:
+  Página single-file (sin build, sin servidor) que:
 
     1. Acepta un payload en JSON o XML en el textarea de la izquierda.
     2. Detecta automáticamente el formato y, si es JSON, lo convierte a XML
-       internamente antes de transformar.
-    3. Acepta una hoja XSLT en el textarea de la derecha.
-    4. Al apretar "Convert", aplica la transformación XSLT usando el
-       XSLTProcessor nativo del navegador y muestra el resultado abajo,
-       haciendo scroll suave hasta él.
-    5. Hace beautify automático al pegar JSON, XML o XSLT.
+       internamente antes de transformar/validar.
+    3. Acepta una hoja XSLT (transformación) o un XSD (validación) en el
+       textarea de la derecha. Detecta automáticamente cuál es.
+    4a. Modo XSLT → "Convert" aplica la transformación con el XSLTProcessor
+        nativo del navegador.
+    4b. Modo XSD  → "Validate" corre xmllint-wasm (libxml2 a WASM, lazy-load
+        desde jsdelivr la primera vez) y reporta valid/invalid + errores.
+    5. Hace beautify automático al pegar JSON, XML, XSLT o XSD.
     6. Persiste ambos inputs en localStorage (sobrevive al recargar).
 
   POR QUÉ ESTÁ TODO EN UN SOLO ARCHIVO
@@ -33,11 +35,12 @@
 
   STACK / TECNOLOGÍAS USADAS
   ──────────────────────────
-  - HTML/CSS/JS vanilla (zero deps).
-  - DOMParser para validar XML/XSLT.
-  - XSLTProcessor (API nativa del navegador) para la transformación real.
+  - HTML/CSS/JS vanilla.
+  - DOMParser para validar XML/XSLT/XSD.
+  - XSLTProcessor (API nativa del navegador) para la transformación XSLT.
+  - xmllint-wasm (libxml2 a WASM, lazy-load desde jsdelivr) para XSD.
   - localStorage para persistencia.
-  - Google Fonts para tipografía (única dependencia externa).
+  - Google Fonts para tipografía.
 
   COSAS QUE ES BUENO SABER ANTES DE EDITAR
   ────────────────────────────────────────
@@ -272,6 +275,7 @@
   }
   .badge.json   { color: var(--accent); border-color: var(--accent); }
   .badge.xml    { color: #6fb3d4;       border-color: #4d7e94; }
+  .badge.xsd    { color: #c08fd4;       border-color: #8c6c9c; }
   .badge.error  { color: var(--danger); border-color: var(--danger); }
   .badge.empty  { color: var(--ink-faint); }
 
@@ -461,7 +465,9 @@
     justify-content: center;
     text-align: center;
   }
-  pre.output-body.error { color: var(--danger); }
+  pre.output-body.error   { color: var(--danger); }
+  pre.output-body.info    { color: var(--ink-dim); font-style: italic; font-family: 'Fraunces', serif; font-size: 15px; display: flex; align-items: center; justify-content: center; text-align: center; }
+  pre.output-body.success { color: var(--ok); }
 
   /* Clases usadas por el syntax highlighter manual del output. */
   .tag-bracket { color: #7a7160; }
@@ -518,7 +524,7 @@
       <span class="logo-mark">f</span>
       <span>XSLT&nbsp;<em>Forge</em></span>
     </div>
-    <div class="tagline">JSON <span>·</span> XML <span>·</span> XSLT &nbsp;Transformer</div>
+    <div class="tagline">JSON <span>·</span> XML <span>·</span> XSLT <span>·</span> XSD &nbsp;Transformer / Validator</div>
     <div class="meta">
       <strong>BROWSER-NATIVE</strong><br/>
       no servers · no uploads
@@ -529,8 +535,8 @@
        HERO: título grande con bajada explicativa
        ════════════════════════════════════════════════════════════════ -->
   <section class="hero">
-    <h1>Forge a payload, <em>transform</em> it with elegance.</h1>
-    <p>Paste a JSON or XML payload on the left — we'll detect its type and beautify it automatically. Drop your XSLT stylesheet on the right, then press <em>Convert</em> to see the transformation rendered below.</p>
+    <h1>Forge a payload, <em>transform</em> or <em>validate</em> it.</h1>
+    <p>Paste a JSON or XML payload on the left — we'll detect its type and beautify it automatically. Drop an XSLT stylesheet on the right to <em>transform</em>, or an XSD schema to <em>validate</em>. The button adapts to whatever you paste.</p>
   </section>
 
   <!-- ════════════════════════════════════════════════════════════════
@@ -564,7 +570,7 @@
       <div class="panel-header">
         <div class="panel-title">
           <span class="panel-num">02 ·</span>
-          <h2>Stylesheet <em>(XSLT)</em></h2>
+          <h2>Stylesheet <em>(XSLT or XSD)</em></h2>
         </div>
         <div class="panel-header-right">
           <span id="xslt-badge" class="badge empty">empty</span>
@@ -574,7 +580,7 @@
       <textarea
         id="xslt"
         spellcheck="false"
-        placeholder='Paste your XSLT here. We&apos;ll auto-format it on paste so you can read it before pressing Convert.'
+        placeholder='Paste an XSLT stylesheet to transform, or an XSD schema to validate. We auto-detect which one based on the root element and beautify it on paste.'
       ></textarea>
     </div>
 
@@ -625,9 +631,10 @@
 */
 const state = {
   payloadValid: false,        // ¿el payload parsea OK?
-  xsltValid:    false,        // ¿el XSLT parsea OK?
+  xsltValid:    false,        // ¿el contenido del panel derecho es un XSLT o XSD válido?
   payloadType:  null,         // 'json' | 'xml' | null
-  payloadAsXmlString: null    // representación XML del payload (siempre que sea válido)
+  payloadAsXmlString: null,   // representación XML del payload (siempre que sea válido)
+  stylesheetMode: null        // 'xslt' | 'xsd' | null — define qué hace el botón
 };
 
 // ── Referencias DOM (cacheadas una sola vez al cargar el script) ──
@@ -906,7 +913,7 @@ function highlightXml(xml) {
    VALIDACIÓN EN VIVO + ACTUALIZACIÓN DE BADGES
    ═══════════════════════════════════════════════════════════════════════════
    Cada vez que el usuario tipea o pega, corremos validatePayload() o
-   validateXslt(). Esto:
+   validateStylesheet(). Esto:
      - Actualiza el badge de estado.
      - Mantiene state.payloadValid / state.xsltValid sincronizados.
      - Llama a refreshConvertState() para habilitar/deshabilitar el botón.
@@ -964,36 +971,68 @@ function validatePayload() {
   refreshConvertState();
 }
 
-function validateXslt() {
+// Determina si el documento del panel derecho es un XSLT, un XSD, u otra cosa.
+// Mira el local-name + namespace del root element — la única forma confiable.
+function detectStylesheetMode(doc) {
+  const root = doc.documentElement;
+  if (!root) return null;
+  const ns = root.namespaceURI;
+  const local = root.localName;
+  if (ns === 'http://www.w3.org/1999/XSL/Transform' &&
+      (local === 'stylesheet' || local === 'transform')) return 'xslt';
+  if (ns === 'http://www.w3.org/2001/XMLSchema' && local === 'schema') return 'xsd';
+  return null;
+}
+
+function validateStylesheet() {
   const text = $xslt.value.trim();
 
   if (!text) {
     state.xsltValid = false;
+    state.stylesheetMode = null;
     setBadge($xsltBadge, 'empty', 'empty');
     refreshConvertState();
     return;
   }
 
-  // XSLT también es XML, así que lo validamos igual.
+  // Validamos sintaxis XML primero — XSLT y XSD son ambos XML.
   const parser = new DOMParser();
   const doc = parser.parseFromString(text, 'application/xml');
   if (doc.querySelector('parsererror')) {
     state.xsltValid = false;
-    setBadge($xsltBadge, 'error', 'XSLT · invalid');
-  } else {
+    state.stylesheetMode = null;
+    setBadge($xsltBadge, 'error', 'invalid xml');
+    refreshConvertState();
+    return;
+  }
+
+  const mode = detectStylesheetMode(doc);
+  if (mode === 'xslt') {
     state.xsltValid = true;
+    state.stylesheetMode = 'xslt';
     setBadge($xsltBadge, 'xml', 'XSLT ✓');
+  } else if (mode === 'xsd') {
+    state.xsltValid = true;
+    state.stylesheetMode = 'xsd';
+    setBadge($xsltBadge, 'xsd', 'XSD ✓');
+  } else {
+    // XML válido pero ni XSLT ni XSD — no sabemos qué hacer con él.
+    state.xsltValid = false;
+    state.stylesheetMode = null;
+    setBadge($xsltBadge, 'error', 'not XSLT/XSD');
   }
 
   refreshConvertState();
 }
 
-// Habilita el botón Convert solo cuando ambos inputs son válidos.
+// Habilita el botón solo cuando ambos inputs son válidos.
+// El label cambia según el modo: "Convert" para XSLT, "Validate" para XSD.
 // La clase .ready dispara la animación de pulso del CSS.
 function refreshConvertState() {
   const ready = state.payloadValid && state.xsltValid;
   $convert.disabled = !ready;
   $convert.classList.toggle('ready', ready);
+  $convert.textContent = state.stylesheetMode === 'xsd' ? 'Validate' : 'Convert';
 }
 
 
@@ -1023,13 +1062,13 @@ $xslt.addEventListener('paste', () => {
   setTimeout(() => {
     const pretty = beautifyXml($xslt.value);
     if (pretty !== null) $xslt.value = pretty;
-    validateXslt();
+    validateStylesheet();
   }, 0);
 });
 
 // Cualquier otro cambio (escribir, borrar) también valida en vivo.
 $payload.addEventListener('input', validatePayload);
-$xslt.addEventListener('input',    validateXslt);
+$xslt.addEventListener('input',    validateStylesheet);
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1062,7 +1101,7 @@ $xslt.addEventListener('input',    () => saveSoon(STORAGE_KEYS.xslt,    $xslt.va
     const p = localStorage.getItem(STORAGE_KEYS.payload);
     const x = localStorage.getItem(STORAGE_KEYS.xslt);
     if (p) { $payload.value = p; validatePayload(); }
-    if (x) { $xslt.value    = x; validateXslt();    }
+    if (x) { $xslt.value    = x; validateStylesheet();    }
   } catch (_) {}
 })();
 
@@ -1078,7 +1117,7 @@ document.querySelectorAll('.btn-clear').forEach(btn => {
     } else if (target === 'xslt') {
       $xslt.value = '';
       try { localStorage.removeItem(STORAGE_KEYS.xslt); } catch (_) {}
-      validateXslt();
+      validateStylesheet();
       $xslt.focus();
     }
   });
@@ -1093,26 +1132,39 @@ document.querySelectorAll('.btn-clear').forEach(btn => {
      - error=false → aplica syntax highlighting y guarda el raw en
                      $copy.dataset.raw para que Copy/Download lo usen.
 */
-function showOutput(text, { error = false } = {}) {
-  $output.classList.remove('empty');
-  $output.classList.toggle('error', error);
+// modes:
+//   default   → output XML transformado, con syntax highlighting + copy/download.
+//   error:true   → texto plano en rojo. Copy/download ENABLED (útil para guardar errores).
+//   info:true    → texto plano gris itálico (estados intermedios tipo "Loading…").
+//                  Copy/download deshabilitados — no es un resultado.
+//   success:true → texto plano en verde (validación OK). Copy/download enabled.
+//   fileName     → nombre sugerido para el download (default 'result.xml').
+function showOutput(text, { error = false, info = false, success = false, fileName = 'result.xml' } = {}) {
+  $output.classList.remove('empty', 'error', 'info', 'success');
+  if (error)   $output.classList.add('error');
+  if (info)    $output.classList.add('info');
+  if (success) $output.classList.add('success');
 
-  if (error) {
+  // Solo aplicamos el highlighter al output XSLT "feliz".
+  if (error || info || success) {
     $output.textContent = text;          // sin HTML para evitar XSS
   } else {
     $output.innerHTML = highlightXml(text);
   }
 
-  $copy.disabled     = error;
-  $download.disabled = error;
-  $copy.dataset.raw  = error ? '' : text;   // guardamos el texto plano para Copy/Download
+  // info es transitorio (estamos cargando algo) — no tiene sentido copiar/descargar.
+  // El resto sí: incluso un mensaje de error o un "valid" se puede querer guardar.
+  $copy.disabled     = info;
+  $download.disabled = info;
+  $copy.dataset.raw  = info ? '' : text;
+  $download.dataset.filename = fileName;
 }
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
    CORE: TRANSFORMACIÓN XSLT
    ═══════════════════════════════════════════════════════════════════════════
-   Acá es donde pasa la magia. Usamos las APIs nativas del navegador:
+   Usamos APIs nativas del navegador:
      - DOMParser     → para parsear payload y XSLT a documentos XML.
      - XSLTProcessor → motor de transformación XSLT 1.0 incorporado.
 
@@ -1120,9 +1172,7 @@ function showOutput(text, { error = false } = {}) {
    producen HTML (output method="html") en lugar de XML, y eso transformToDocument
    maneja distinto que en una hoja "method=xml".
 */
-$convert.addEventListener('click', () => {
-  if (!state.payloadValid || !state.xsltValid) return;
-
+function runXsltTransform() {
   try {
     const parser = new DOMParser();
 
@@ -1161,17 +1211,98 @@ $convert.addEventListener('click', () => {
 
     // 4. Beautify del resultado (si parsea como XML).
     const prettified = beautifyXml(serialized) || serialized;
-    showOutput(prettified);
-
-    // 5. Smooth-scroll hasta el output (esto era requerimiento explícito).
-    document.getElementById('output-section').scrollIntoView({
-      behavior: 'smooth',
-      block: 'start'
-    });
+    showOutput(prettified, { fileName: 'result.xml' });
 
   } catch (err) {
     showOutput('Transformation failed: ' + (err.message || err), { error: true });
   }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   CORE: VALIDACIÓN XSD (xmllint-wasm)
+   ═══════════════════════════════════════════════════════════════════════════
+   El navegador NO trae validador de XSD nativo. Usamos xmllint-wasm
+   (libxml2 compilado a WASM) cargado lazy desde jsdelivr — solo la primera
+   vez que el usuario aprieta "Validate". Pesa ~870KB pero como la app
+   usa todo offline-friendly, queda cacheado en el browser.
+
+   Nota sobre Firefox: la versión actual de xmllint-wasm requiere soporte de
+   ES Modules en Web Workers, que Firefox aún no implementa. Si falla la
+   carga ahí, mostramos un error claro.
+*/
+const XMLLINT_URL = 'https://cdn.jsdelivr.net/npm/xmllint-wasm@5.2.0/index-browser.mjs';
+let xmllintPromise = null;
+
+function loadXmllint() {
+  if (!xmllintPromise) {
+    xmllintPromise = import(XMLLINT_URL).catch(err => {
+      // Permitimos un retry — limpiamos el cache si falló.
+      xmllintPromise = null;
+      throw err;
+    });
+  }
+  return xmllintPromise;
+}
+
+async function runXsdValidation() {
+  // Mensaje de "loading" (sobre todo la primera vez, que tiene que bajar el wasm).
+  showOutput('Loading XSD validator (libxml2-wasm)…', { info: true });
+
+  let xmllint;
+  try {
+    xmllint = await loadXmllint();
+  } catch (err) {
+    showOutput(
+      'Could not load XSD validator from CDN.\n' +
+      '(Firefox is not supported by xmllint-wasm yet — try Chrome or Edge.)\n\n' +
+      (err.message || err),
+      { error: true, fileName: 'validation-error.txt' }
+    );
+    return;
+  }
+
+  showOutput('Validating against schema…', { info: true });
+
+  try {
+    const result = await xmllint.validateXML({
+      xml:    [{ fileName: 'payload.xml', contents: state.payloadAsXmlString }],
+      schema: [$xslt.value]
+    });
+
+    if (result.valid) {
+      showOutput(
+        '✓ Document is valid against the schema.',
+        { success: true, fileName: 'validation-ok.txt' }
+      );
+    } else {
+      // Cada error trae rawMessage tipo "payload.xml:21: element X: ...".
+      const lines = (result.errors || []).map(e => e.rawMessage || e.message || String(e));
+      const body  = `✗ Validation failed — ${lines.length} error${lines.length === 1 ? '' : 's'}:\n\n` +
+                    lines.join('\n');
+      showOutput(body, { error: true, fileName: 'validation-errors.txt' });
+    }
+  } catch (err) {
+    showOutput('Validation failed: ' + (err.message || err), { error: true });
+  }
+}
+
+
+// Dispatch del botón principal según qué tenga pegado el usuario.
+$convert.addEventListener('click', async () => {
+  if (!state.payloadValid || !state.xsltValid) return;
+
+  if (state.stylesheetMode === 'xsd') {
+    await runXsdValidation();
+  } else {
+    runXsltTransform();
+  }
+
+  // Smooth-scroll hasta el output (requerimiento original).
+  document.getElementById('output-section').scrollIntoView({
+    behavior: 'smooth',
+    block: 'start'
+  });
 });
 
 
@@ -1197,10 +1328,12 @@ $copy.addEventListener('click', async () => {
 $download.addEventListener('click', () => {
   const raw = $copy.dataset.raw;
   if (!raw) return;
-  const blob = new Blob([raw], { type: 'application/xml' });
+  const fileName = $download.dataset.filename || 'result.xml';
+  const mime = fileName.endsWith('.xml') ? 'application/xml' : 'text/plain';
+  const blob = new Blob([raw], { type: mime });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'result.xml';
+  a.download = fileName;
   a.click();
   URL.revokeObjectURL(a.href);   // liberamos memoria
 });
